@@ -1,0 +1,175 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: choose-course-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: hsp
+      MYSQL_DATABASE: choose_course
+      TZ: Asia/Shanghai
+    ports:
+      - "23307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -phsp --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: choose-course-redis
+    command: ["redis-server", "--requirepass", "Cheung", "--appendonly", "yes"]
+    ports:
+      - "16380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a Cheung ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: choose-course-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      TZ: Asia/Shanghai
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: choose-course-migrate
+    command: ["./migrate", "-seed"]
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: docker
+      LOG_LEVEL: info
+      LOG_ENCODING: json
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: hsp
+      MYSQL_DBNAME: choose_course
+      MYSQL_LOC: Local
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: choose-course-backend
+    command: ["./server"]
+    environment:
+      TZ: Asia/Shanghai
+      GIN_MODE: release
+      APP_NAME: choose-course
+      APP_ENV: docker
+      APP_PORT: 8080
+      APP_SHUTDOWN_TIMEOUT_SECONDS: 10
+      LOG_LEVEL: info
+      LOG_ENCODING: json
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: hsp
+      MYSQL_DBNAME: choose_course
+      MYSQL_LOC: Local
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: Cheung
+      REDIS_DB: 0
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      RABBITMQ_VHOST: /
+      JWT_SECRET: choose-course-dev-secret
+      JWT_EXPIRE_HOURS: 24
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "18080:8080"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: choose-course-worker
+    command: ["./worker"]
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: docker
+      LOG_LEVEL: info
+      LOG_ENCODING: json
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: hsp
+      MYSQL_DBNAME: choose_course
+      MYSQL_LOC: Local
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: Cheung
+      REDIS_DB: 0
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      RABBITMQ_VHOST: /
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  k6:
+    image: grafana/k6:latest
+    container_name: choose-course-k6
+    working_dir: /work
+    entrypoint: ["k6"]
+    pull_policy: never
+    volumes:
+      - ./tests:/work/tests:ro
+    environment:
+      TZ: Asia/Shanghai
+    depends_on:
+      backend:
+        condition: service_started
+    profiles:
+      - tools
+
+volumes:
+  mysql_data:
+  redis_data:
+  rabbitmq_data:

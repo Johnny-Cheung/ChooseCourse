@@ -1,0 +1,358 @@
+# 压测总结与 5000 档稳定复现指南
+
+- 日期：2026-04-07
+- 项目：`ChooseCourse` Backend
+- 压测环境：Windows + Docker Desktop + WSL2
+
+## 1. 今日压测结论
+
+今天真正值得记录的只有两件事：
+
+1. `k6` 不应继续从宿主机通过 `127.0.0.1:18080` 打后端，而应放到 Docker 内网中执行。
+2. `k6` 在当前“先登录、再抢课”的脚本模型下，需要关闭 HTTP 连接复用，否则会出现 `EOF`、`server closed idle connection` 这类传输层噪音。
+
+在这两个调整都生效后，`5000` 学生抢一门容量 `500` 的课程可以稳定复现，且结果正确：
+
+- `checks_failed = 0`
+- `http_req_failed = 0`
+- `courses.selected_count = 500`
+- `enrollments` 实际成功人数 `actual_selected = 500`
+- 无重复成功选课记录
+- 无超卖
+
+## 2. 需要记录的问题与解决方法
+
+### 2.1 问题一：`k6` 放在宿主机上跑，不够稳定
+
+#### 现象
+
+当 `k6` 直接在 Windows 宿主机上运行，并通过下面这个地址压测后端时：
+
+```text
+http://127.0.0.1:18080/api/v1
+```
+
+高并发场景下会出现这类错误：
+
+```text
+connectex: actively refused
+```
+
+#### 原因
+
+宿主机模式下，请求路径实际上是：
+
+```text
+k6(宿主机) -> Windows 本地端口 18080 -> Docker Desktop 端口转发 -> backend 容器
+```
+
+这意味着压测流量会先经过一层宿主机端口映射和 Docker Desktop 转发。  
+并发一高，先出问题的可能不是后端服务本身，而是 Windows 本地端口转发链路。
+
+#### 解决方法
+
+把 `k6` 放进 Docker 网络里运行，直接访问：
+
+```text
+http://backend:8080/api/v1
+```
+
+这样压测链路变成：
+
+```text
+k6容器 -> backend容器
+```
+
+这样做的好处是：
+
+1. 避开宿主机 `18080` 端口转发
+2. 避免 Windows 本地网络层成为主要瓶颈
+3. 压测结果更接近后端服务本身的承载能力
+
+#### 最终做法
+
+在 [docker-compose.yml](C:/Users/29332/Desktop/ChooseCourse/Backend/docker-compose.yml) 中增加了 `k6` 工具服务，之后统一使用：
+
+```powershell
+docker compose --profile tools run --rm k6 ...
+```
+
+### 2.2 问题二：`k6` 复用旧连接，导致 TCP 断联噪音
+
+#### 现象
+
+在脚本先批量登录、再正式抢课的模型下，压测中曾经出现：
+
+```text
+EOF
+server closed idle connection
+```
+
+#### 原因
+
+这份脚本会先在 `setup()` 阶段给大量学生批量登录，然后再进入正式的抢课阶段。
+
+默认情况下，`k6` 会复用已经建立过的 HTTP 连接。  
+但部分连接在登录阶段结束后已经空闲了一段时间，被服务端关闭；`k6` 仍尝试复用这些已经失效的旧连接，于是就出现了：
+
+- `EOF`
+- `server closed idle connection`
+
+这不是业务逻辑错误，也不代表后端一定崩了，而是连接层复用了已经被对端关闭的空闲连接。
+
+#### 解决方法
+
+在压测脚本 [select_many_students.js](C:/Users/29332/Desktop/ChooseCourse/Backend/tests/select_many_students.js) 中保留了连接复用开关：
+
+```text
+NO_CONNECTION_REUSE=1
+```
+
+稳定压测时固定开启：
+
+```powershell
+-e NO_CONNECTION_REUSE=1
+```
+
+这样 `k6` 不再复用这些可能已经失效的旧连接，`EOF` 和 `idle connection` 这类错误就消失了。
+
+## 3. 当前保留的稳定压测基线
+
+当前这台机器上，建议只保留一档稳定压测基线：
+
+### 5000 学生抢 500 容量课程
+
+稳定参数：
+
+```text
+USERS=5000
+STUDENT_PREFIX=2199
+STUDENT_PAD_WIDTH=4
+SPREAD_MS=1000
+LOGIN_BATCH_SIZE=200
+SETUP_TIMEOUT=25m
+NO_CONNECTION_REUSE=1
+```
+
+稳定命令：
+
+```powershell
+docker compose --profile tools run --rm k6 run -e BASE_URL=http://backend:8080/api/v1 -e COURSE_ID=<课程ID> -e USERS=5000 -e STUDENT_PREFIX=2199 -e STUDENT_PAD_WIDTH=4 -e SPREAD_MS=1000 -e LOGIN_BATCH_SIZE=200 -e SETUP_TIMEOUT=25m -e NO_CONNECTION_REUSE=1 /work/tests/select_many_students.js
+```
+
+## 4. 5000 档完整操作步骤
+
+下面这套步骤从“删数据卷、重新起环境”开始，完整复现一轮 `5000` 学生抢 `500` 容量课程的稳定压测。
+
+### 4.1 删除旧数据卷并停掉环境
+
+```powershell
+cd C:\Users\29332\Desktop\ChooseCourse\Backend
+docker compose down -v --remove-orphans
+```
+
+### 4.2 重新启动整套服务
+
+```powershell
+docker compose up --build -d
+docker compose ps
+```
+
+预期：
+
+1. `mysql`、`redis`、`rabbitmq` 为 `Up`
+2. `migrate` 最终为 `Exited (0)`
+3. `backend`、`worker` 为 `Up`
+
+### 4.3 健康检查
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:18080/health | ConvertTo-Json -Depth 5
+```
+
+预期返回：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "mysql": "up",
+    "rabbitmq": "up",
+    "redis": "up"
+  }
+}
+```
+
+如果这里失败，直接再补一次：
+
+```powershell
+docker compose up -d
+```
+
+然后重新检查 `/health`。
+
+### 4.4 导入 5000 压测学生
+
+```powershell
+Get-Content -Raw .\tests\seed_stress_students_5000.sql | docker exec -i choose-course-mysql mysql -uroot -phsp choose_course
+```
+
+可选验证：
+
+```powershell
+docker exec choose-course-mysql mysql -uroot -phsp choose_course -e "SELECT COUNT(*) AS cnt FROM students WHERE student_no BETWEEN '21990001' AND '21995000';"
+```
+
+预期：
+
+```text
+cnt
+5000
+```
+
+### 4.5 管理员登录并创建新课程
+
+推荐用 Postman。
+
+#### 管理员登录
+
+```http
+POST http://127.0.0.1:18080/api/v1/auth/admin/login
+Content-Type: application/json
+
+{"admin_no":"A0001","password":"123456"}
+```
+
+从响应里取：
+
+```text
+data.access_token
+```
+
+#### 创建课程
+
+```http
+POST http://127.0.0.1:18080/api/v1/admin/courses
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+    "course_name":"k6-5000-students",
+    "teacher_name":"Load Test Teacher",
+    "capacity":500,
+    "time_slot":19,
+    "credit":2,
+    "status":1
+}
+```
+
+从响应里记录：
+
+```text
+data.id
+```
+
+这个 `data.id` 就是后面压测用的课程 ID。
+
+### 4.6 在 Docker 内网中执行 k6 压测
+
+把下面 `<课程ID>` 替换成上一步创建出来的真实课程 ID：
+
+```powershell
+docker compose --profile tools run --rm k6 run -e BASE_URL=http://backend:8080/api/v1 -e COURSE_ID=8 -e USERS=4000 -e STUDENT_PREFIX=2199 -e STUDENT_PAD_WIDTH=4 -e SPREAD_MS=0 -e LOGIN_BATCH_SIZE=200 -e SETUP_TIMEOUT=25m -e NO_CONNECTION_REUSE=1 /work/tests/select_many_students.js
+```
+
+说明：
+
+1. `BASE_URL` 必须是 `http://backend:8080/api/v1`
+2. 不再走宿主机 `18080`
+3. `NO_CONNECTION_REUSE=1` 是稳定运行所必需的
+
+### 4.7 等待异步消费完成后验证结果
+
+压测结束后等待 `5` 秒，再分别执行下面这几条命令。把 `<课程ID>` 替换成真实课程 ID：
+
+```powershell
+docker exec -it choose-course-mysql mysql -uroot -phsp choose_course -e "SELECT status, COUNT(*) AS cnt FROM selection_requests WHERE course_id = 15 GROUP BY status;"
+```
+
+```powershell
+docker exec -it choose-course-mysql mysql -uroot -phsp choose_course -e "SELECT id, capacity, selected_count, status FROM courses WHERE id = 15;"
+```
+
+```powershell
+docker exec -it choose-course-mysql mysql -uroot -phsp choose_course -e "SELECT COUNT(*) AS actual_selected FROM enrollments WHERE course_id = 15 AND status = 1;"
+```
+
+```powershell
+docker exec -it choose-course-mysql mysql -uroot -phsp choose_course -e "SELECT student_id, COUNT(*) AS cnt FROM enrollments WHERE course_id = 15 AND status = 1 GROUP BY student_id HAVING COUNT(*) > 1;"
+```
+
+### 4.8 预期结果
+
+应看到：
+
+1. `courses.selected_count = 500`
+2. `actual_selected = 500`
+3. 重复成功记录查询为空
+4. 无超卖
+5. `checks_failed = 0`
+6. `http_req_failed = 0`
+
+## 5. 如果只是反复重跑 5000 档
+
+不必每次都删数据卷。重复跑时只需要：
+
+1. 重置学生池
+
+```powershell
+Get-Content -Raw .\tests\reset_stress_students_5000.sql | docker exec -i choose-course-mysql mysql -uroot -phsp choose_course
+```
+
+2. 清 Redis
+
+```powershell
+docker exec choose-course-redis redis-cli -a Cheung FLUSHDB
+```
+
+3. 创建一门全新的 500 容量课程
+
+4. 继续使用同一条稳定版 `k6` 命令
+
+### 6. 测试结果
+
+```powershell
+  █ TOTAL RESULTS
+
+    checks_total.......: 12000   294.041722/s
+    checks_succeeded...: 100.00% 12000 out of 12000
+    checks_failed......: 0.00%   0 out of 12000
+
+    ✓ login http status is 200
+    ✓ login business code is 0
+    ✓ submit returns expected http status
+
+    HTTP
+    http_req_duration..............: avg=34.77ms min=588.92µs med=52.91ms max=311.9ms  p(90)=58.6ms  p(95)=64.41ms
+      { expected_response:true }...: avg=34.77ms min=588.92µs med=52.91ms max=311.9ms  p(90)=58.6ms  p(95)=64.41ms
+    http_req_failed................: 0.00%  0 out of 8000
+    http_reqs......................: 8000   196.027815/s
+
+    EXECUTION
+    iteration_duration.............: avg=17.29ms min=960.1µs  med=4.42ms  max=334.17ms p(90)=60.63ms p(95)=107.96ms
+    iterations.....................: 4000   98.013907/s
+    vus............................: 27     min=0         max=2665
+    vus_max........................: 4000   min=4000      max=4000
+
+    NETWORK
+    data_received..................: 6.0 MB 147 kB/s
+    data_sent......................: 2.5 MB 60 kB/s
+
+
+
+
+running (00m40.8s), 0000/4000 VUs, 4000 complete and 0 interrupted iterations
+select_once ✓ [======================================] 4000 VUs  00m03.0s/10m0s  4000/4000 iters, 1 per VU
+```
+

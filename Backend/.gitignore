@@ -1,0 +1,19 @@
+# Go 编译产物目录
+/bin/
+
+# 打包产物目录
+/dist/
+
+# Windows 下 go build 生成的可执行文件
+/*.exe
+
+# 本地调试时输出的日志文件
+/server.stdout.log
+/server.stderr.log
+
+# 本地 Go 构建缓存目录
+/.gocache/
+
+# 真正的本地配置文件通常包含密码，不提交到仓库
+/configs/config.yaml
+*.log

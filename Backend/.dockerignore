@@ -1,0 +1,11 @@
+.git
+.gitignore
+.gocache
+bin/*.exe
+bin/*
+!bin/server
+!bin/worker
+!bin/migrate
+server.log
+*.md
+tests

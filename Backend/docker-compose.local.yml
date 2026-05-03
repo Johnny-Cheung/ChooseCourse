@@ -1,0 +1,15 @@
+services:
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.local

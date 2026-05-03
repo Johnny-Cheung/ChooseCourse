@@ -1,0 +1,12 @@
+FROM scratch
+
+WORKDIR /app
+
+COPY bin/server /app/server
+COPY bin/worker /app/worker
+COPY bin/migrate /app/migrate
+COPY configs /app/configs
+
+EXPOSE 8080
+
+CMD ["./server"]

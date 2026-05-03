@@ -1,0 +1,70 @@
+# app: 应用自身配置
+app:
+  # 应用名，主要用于日志和后续服务标识
+  name: choose-course
+  # 当前运行环境，可选 dev/test/prod
+  env: dev
+  # HTTP 服务监听端口
+  port: 8080
+  # 收到退出信号后，优雅停机最多等待多少秒
+  shutdown_timeout_seconds: 10
+
+# log: 日志配置
+log:
+  # 日志级别，可选 debug/info/warn/error
+  level: info
+  # 输出格式，可选 console/json
+  encoding: console
+
+# mysql: MySQL 数据库连接配置
+mysql:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: replace-me
+  # 目标数据库名，需要提前创建好
+  dbname: choose_course
+  charset: utf8mb4
+  parse_time: true
+  loc: Local
+  # 下面三项是连接池配置
+  max_idle_conns: 10
+  max_open_conns: 100
+  conn_max_lifetime_minutes: 60
+
+# redis: Redis 连接配置
+redis:
+  host: 127.0.0.1
+  port: 6379
+  password: replace-me
+  # 使用哪个逻辑库
+  db: 0
+  pool_size: 20
+  min_idle_conns: 5
+
+# rabbitmq: M7 异步抢课使用的消息队列配置
+rabbitmq:
+  host: 127.0.0.1
+  port: 5672
+  user: guest
+  password: guest
+  vhost: /
+  selection_exchange: course.selection.exchange
+  grab_queue: course.selection.grab.queue
+  grab_routing_key: selection.grab
+  # 同一门课会固定落到同一个分片队列；不同课程可以并行消费
+  selection_shard_count: 4
+  selection_dead_exchange: course.selection.dead.exchange
+  grab_dead_queue: course.selection.grab.dlq
+  grab_dead_routing_key: selection.grab.dead
+  notification_exchange: course.notification.exchange
+  notification_queue: course.notification.queue
+  notification_routing_key: notification.student
+  notification_dead_exchange: course.notification.dead.exchange
+  notification_dead_queue: course.notification.dlq
+  notification_dead_routing_key: notification.student.dead
+
+# jwt: 后续登录鉴权会用到
+jwt:
+  secret: replace-me
+  expire_hours: 24
