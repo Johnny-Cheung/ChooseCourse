@@ -20,6 +20,7 @@ const NO_CONNECTION_REUSE = __ENV.NO_CONNECTION_REUSE === '1';
 const NO_VU_CONNECTION_REUSE = __ENV.NO_VU_CONNECTION_REUSE === '1';
 const VU_RAMP_DURATION = __ENV.VU_RAMP_DURATION || '';
 const HOLD_AFTER_SUBMIT_SECONDS = Number(__ENV.HOLD_AFTER_SUBMIT_SECONDS || 60);
+const PRINT_SELECT_PHASE_SUMMARY = __ENV.PRINT_SELECT_PHASE_SUMMARY !== '0';
 
 let hasSubmitted = false;
 
@@ -130,7 +131,11 @@ export function setup() {
     }
   }
 
-  return { tokens };
+  return {
+    tokens,
+    selectPhaseStartedAtMs: Date.now(),
+    expectedSelectSubmissions: USERS,
+  };
 }
 
 export default function (data) {
@@ -180,4 +185,19 @@ export default function (data) {
   if (VU_RAMP_DURATION !== '') {
     sleep(HOLD_AFTER_SUBMIT_SECONDS);
   }
+}
+
+export function teardown(data) {
+  if (!PRINT_SELECT_PHASE_SUMMARY || !data || !data.selectPhaseStartedAtMs) {
+    return;
+  }
+
+  const durationMs = Date.now() - data.selectPhaseStartedAtMs;
+  const durationSeconds = durationMs / 1000;
+  const submissions = Number(data.expectedSelectSubmissions || USERS);
+  const qps = durationSeconds > 0 ? submissions / durationSeconds : 0;
+
+  console.log(
+    `[select_phase_summary] submissions=${submissions} duration=${durationSeconds.toFixed(3)}s qps=${qps.toFixed(3)}/s`
+  );
 }
