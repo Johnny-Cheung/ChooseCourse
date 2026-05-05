@@ -119,6 +119,8 @@ func handleSelectionError(c *gin.Context, err error) {
 		response.Fail(c, http.StatusBadRequest, errno.CodeCourseNotSelected, errno.Message(errno.CodeCourseNotSelected))
 	case errors.Is(err, service.ErrSelectionRequestNotFound):
 		response.Fail(c, http.StatusNotFound, errno.CodeSelectionReqNotFound, errno.Message(errno.CodeSelectionReqNotFound))
+	case errors.Is(err, service.ErrSelectionCacheBusy):
+		response.Fail(c, http.StatusServiceUnavailable, errno.CodeSystemBusy, errno.Message(errno.CodeSystemBusy))
 	default:
 		response.Fail(c, http.StatusInternalServerError, errno.CodeInternalServerError, errno.Message(errno.CodeInternalServerError))
 	}

@@ -34,6 +34,7 @@ const (
 	CodeInvalidComment       = 4005
 	CodeNotificationNotFound = 4006
 	CodeInternalServerError  = 5000
+	CodeSystemBusy           = 5001
 )
 
 // messages 用来把错误码映射成默认提示语。
@@ -69,6 +70,7 @@ var messages = map[int]string{
 	CodeInvalidComment:       "invalid comment content",
 	CodeNotificationNotFound: "notification not found",
 	CodeInternalServerError:  "internal server error",
+	CodeSystemBusy:           "system busy, please retry later",
 }
 
 // Message 根据错误码返回默认文案。

@@ -2,16 +2,24 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"strconv"
 
 	"choose-course-backend/internal/model"
 	"choose-course-backend/internal/repository"
+	"gorm.io/gorm"
 )
 
 // EnsureStudentSelectionCache 确保某个学生的 Redis 缓存已经存在。
 //
 // 如果当前学生相关缓存不完整，就会从 MySQL 回源补建。
 func EnsureStudentSelectionCache(ctx context.Context, studentID uint64) error {
+	if missing, err := hasStudentMissingCache(ctx, studentID); err != nil {
+		return err
+	} else if missing {
+		return ErrStudentSelectionCacheNotFound
+	}
+
 	// 先检查学生缓存是否完整存在。
 	ready, err := hasStudentSelectionCache(ctx, studentID)
 	if err != nil {
@@ -19,6 +27,28 @@ func EnsureStudentSelectionCache(ctx context.Context, studentID uint64) error {
 	}
 
 	// 如果关键键都在，说明学生缓存已经就绪。
+	if ready {
+		return nil
+	}
+
+	token, locked, err := acquireSelectionCacheRebuildLock(ctx, StudentRebuildLockKey(studentID))
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return waitForStudentSelectionCache(ctx, studentID)
+	}
+	defer releaseSelectionCacheRebuildLock(ctx, StudentRebuildLockKey(studentID), token)
+
+	if missing, err := hasStudentMissingCache(ctx, studentID); err != nil {
+		return err
+	} else if missing {
+		return ErrStudentSelectionCacheNotFound
+	}
+	ready, err = hasStudentSelectionCache(ctx, studentID)
+	if err != nil {
+		return err
+	}
 	if ready {
 		return nil
 	}
@@ -47,6 +77,11 @@ func RefreshStudentSelectionCache(ctx context.Context, studentID uint64) error {
 	if err := repository.DB().
 		Select("id", "credit_used", "credit_limit").
 		First(&student, studentID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			_ = InvalidateStudentSelectionCache(ctx, studentID)
+			_ = setStudentMissingCache(ctx, studentID)
+			return ErrStudentSelectionCacheNotFound
+		}
 		return err
 	}
 
@@ -96,6 +131,7 @@ func RefreshStudentSelectionCache(ctx context.Context, studentID uint64) error {
 	pipe.Set(ctx, StudentCreditLimitKey(studentID), student.CreditLimit, 0)
 	// 写入“时间片位图”。
 	pipe.Set(ctx, StudentSlotBitmapKey(studentID), slotBitmap, 0)
+	pipe.Del(ctx, StudentMissingKey(studentID))
 
 	// 统一提交 pipeline。
 	_, err = pipe.Exec(ctx)
@@ -116,6 +152,7 @@ func InvalidateStudentSelectionCache(ctx context.Context, studentID uint64) erro
 		StudentCreditUsedKey(studentID),
 		StudentCreditLimitKey(studentID),
 		StudentSlotBitmapKey(studentID),
+		StudentMissingKey(studentID),
 	).Err()
 }
 
@@ -139,6 +176,42 @@ func hasStudentSelectionCache(ctx context.Context, studentID uint64) (bool, erro
 	}
 
 	return exists == 4, nil
+}
+
+func hasStudentMissingCache(ctx context.Context, studentID uint64) (bool, error) {
+	client, err := redisClient()
+	if err != nil {
+		return false, err
+	}
+
+	exists, err := client.Exists(ctx, StudentMissingKey(studentID)).Result()
+	if err != nil {
+		return false, err
+	}
+
+	return exists == 1, nil
+}
+
+func setStudentMissingCache(ctx context.Context, studentID uint64) error {
+	client, err := redisClient()
+	if err != nil {
+		return err
+	}
+
+	return client.Set(ctx, StudentMissingKey(studentID), 1, selectionMissingCacheTTL()).Err()
+}
+
+func waitForStudentSelectionCache(ctx context.Context, studentID uint64) error {
+	return waitForSelectionCacheReady(
+		ctx,
+		func(ctx context.Context) (bool, error) {
+			return hasStudentSelectionCache(ctx, studentID)
+		},
+		func(ctx context.Context) (bool, error) {
+			return hasStudentMissingCache(ctx, studentID)
+		},
+		ErrStudentSelectionCacheNotFound,
+	)
 }
 
 // timeSlotBitmap 把单个 time_slot 映射成一个位图值。

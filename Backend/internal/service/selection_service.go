@@ -43,6 +43,8 @@ var (
 	ErrCourseNotSelected = errors.New("course not selected")
 	// ErrSelectionRequestNotFound 表示按 request_no 没有查到请求记录。
 	ErrSelectionRequestNotFound = errors.New("selection request not found")
+	// ErrSelectionCacheBusy 表示热点缓存正在重建，当前请求需要稍后重试。
+	ErrSelectionCacheBusy = errors.New("selection cache rebuild busy")
 )
 
 // SelectionActionResult 是“抢课成功”或“退课成功”后返回给前端的数据。
@@ -110,7 +112,7 @@ func (s *SelectionService) SelectCourse(studentID, courseID uint64) (*SelectionA
 	// 尽量放到 Redis 一次性完成。
 	precheckCode, err := cache.PrecheckAndReserveSelection(ctx, studentID, courseID)
 	if err != nil {
-		return nil, err
+		return nil, mapSelectionCacheError(err)
 	}
 
 	// 如果 Lua 返回的不是 OK，而是某种业务失败码，
@@ -475,8 +477,23 @@ func mapSelectPrecheckCode(code cache.SelectPrecheckCode) error {
 		return ErrSelectionTimeConflict
 	case cache.SelectPrecheckInsufficientCredit:
 		return ErrInsufficientCredits
+	case cache.SelectPrecheckCacheMiss:
+		return ErrSelectionCacheBusy
 	default:
 		return fmt.Errorf("unexpected redis precheck code: %d", code)
+	}
+}
+
+func mapSelectionCacheError(err error) error {
+	switch {
+	case errors.Is(err, cache.ErrCourseSelectionCacheNotFound):
+		return ErrCourseNotFound
+	case errors.Is(err, cache.ErrStudentSelectionCacheNotFound):
+		return ErrStudentNotFound
+	case errors.Is(err, cache.ErrSelectionCacheRebuildBusy):
+		return ErrSelectionCacheBusy
+	default:
+		return err
 	}
 }
 

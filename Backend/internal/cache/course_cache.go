@@ -2,11 +2,13 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"choose-course-backend/internal/model"
 	"choose-course-backend/internal/repository"
 	"github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
 )
 
 // EnsureCourseSelectionCache 确保某门课的 Redis 缓存已经存在。
@@ -15,6 +17,12 @@ import (
 // - 如果缓存已经完整存在，就直接返回
 // - 如果有任何一个键缺失，就从 MySQL 重新加载整门课的缓存
 func EnsureCourseSelectionCache(ctx context.Context, courseID uint64) error {
+	if missing, err := hasCourseMissingCache(ctx, courseID); err != nil {
+		return err
+	} else if missing {
+		return ErrCourseSelectionCacheNotFound
+	}
+
 	// 先判断课程缓存是否已经完整存在。
 	ready, err := hasCourseSelectionCache(ctx, courseID)
 	if err != nil {
@@ -22,6 +30,28 @@ func EnsureCourseSelectionCache(ctx context.Context, courseID uint64) error {
 	}
 
 	// 如果 4 个关键课程键都在，就说明缓存可直接用，不需要回源。
+	if ready {
+		return nil
+	}
+
+	token, locked, err := acquireSelectionCacheRebuildLock(ctx, CourseRebuildLockKey(courseID))
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return waitForCourseSelectionCache(ctx, courseID)
+	}
+	defer releaseSelectionCacheRebuildLock(ctx, CourseRebuildLockKey(courseID), token)
+
+	if missing, err := hasCourseMissingCache(ctx, courseID); err != nil {
+		return err
+	} else if missing {
+		return ErrCourseSelectionCacheNotFound
+	}
+	ready, err = hasCourseSelectionCache(ctx, courseID)
+	if err != nil {
+		return err
+	}
 	if ready {
 		return nil
 	}
@@ -51,6 +81,11 @@ func RefreshCourseSelectionCache(ctx context.Context, courseID uint64) error {
 	if err := repository.DB().
 		Select("id", "capacity", "selected_count", "status", "credit", "time_slot").
 		First(&course, courseID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			_ = InvalidateCourseSelectionCache(ctx, courseID)
+			_ = setCourseMissingCache(ctx, courseID)
+			return ErrCourseSelectionCacheNotFound
+		}
 		return err
 	}
 
@@ -73,6 +108,7 @@ func RefreshCourseSelectionCache(ctx context.Context, courseID uint64) error {
 	pipe.Set(ctx, CourseCreditKey(courseID), course.Credit, 0)
 	// 课程时间片。
 	pipe.Set(ctx, CourseSlotKey(courseID), course.TimeSlot, 0)
+	pipe.Del(ctx, CourseMissingKey(courseID))
 
 	// 统一执行 pipeline 里的写操作。
 	_, err = pipe.Exec(ctx)
@@ -97,6 +133,7 @@ func InvalidateCourseSelectionCache(ctx context.Context, courseID uint64) error 
 		CourseStatusKey(courseID),
 		CourseCreditKey(courseID),
 		CourseSlotKey(courseID),
+		CourseMissingKey(courseID),
 	).Err()
 }
 
@@ -123,6 +160,42 @@ func hasCourseSelectionCache(ctx context.Context, courseID uint64) (bool, error)
 	}
 
 	return exists == 4, nil
+}
+
+func hasCourseMissingCache(ctx context.Context, courseID uint64) (bool, error) {
+	client, err := redisClient()
+	if err != nil {
+		return false, err
+	}
+
+	exists, err := client.Exists(ctx, CourseMissingKey(courseID)).Result()
+	if err != nil {
+		return false, err
+	}
+
+	return exists == 1, nil
+}
+
+func setCourseMissingCache(ctx context.Context, courseID uint64) error {
+	client, err := redisClient()
+	if err != nil {
+		return err
+	}
+
+	return client.Set(ctx, CourseMissingKey(courseID), 1, selectionMissingCacheTTL()).Err()
+}
+
+func waitForCourseSelectionCache(ctx context.Context, courseID uint64) error {
+	return waitForSelectionCacheReady(
+		ctx,
+		func(ctx context.Context) (bool, error) {
+			return hasCourseSelectionCache(ctx, courseID)
+		},
+		func(ctx context.Context) (bool, error) {
+			return hasCourseMissingCache(ctx, courseID)
+		},
+		ErrCourseSelectionCacheNotFound,
+	)
 }
 
 // redisClient 是 cache 包内部统一取 Redis 客户端的小工具函数。

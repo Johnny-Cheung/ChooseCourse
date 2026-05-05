@@ -75,6 +75,7 @@ func preloadOpenCourseSelectionCaches(ctx context.Context, client *redis.Client,
 			pipe.Set(ctx, CourseStatusKey(course.ID), course.Status, 0)
 			pipe.Set(ctx, CourseCreditKey(course.ID), course.Credit, 0)
 			pipe.Set(ctx, CourseSlotKey(course.ID), course.TimeSlot, 0)
+			pipe.Del(ctx, CourseMissingKey(course.ID))
 		}
 
 		if _, err := pipe.Exec(ctx); err != nil {
@@ -116,6 +117,7 @@ func invalidateClosedCourseSelectionCaches(ctx context.Context, client *redis.Cl
 				CourseStatusKey(course.ID),
 				CourseCreditKey(course.ID),
 				CourseSlotKey(course.ID),
+				CourseMissingKey(course.ID),
 			)
 		}
 
@@ -187,6 +189,7 @@ func preloadStudentSelectionCaches(ctx context.Context, client *redis.Client, re
 			pipe.Set(ctx, StudentCreditUsedKey(student.ID), student.CreditUsed, 0)
 			pipe.Set(ctx, StudentCreditLimitKey(student.ID), student.CreditLimit, 0)
 			pipe.Set(ctx, StudentSlotBitmapKey(student.ID), slotBitmaps[student.ID], 0)
+			pipe.Del(ctx, StudentMissingKey(student.ID))
 		}
 
 		if _, err := pipe.Exec(ctx); err != nil {

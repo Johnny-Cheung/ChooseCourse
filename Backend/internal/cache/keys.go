@@ -44,6 +44,16 @@ func CourseSlotKey(courseID uint64) string {
 	return fmt.Sprintf("course:slot:%d", courseID)
 }
 
+// CourseMissingKey 返回“课程不存在”空值缓存键。
+func CourseMissingKey(courseID uint64) string {
+	return fmt.Sprintf("course:missing:%d", courseID)
+}
+
+// CourseRebuildLockKey 返回课程缓存重建锁键。
+func CourseRebuildLockKey(courseID uint64) string {
+	return fmt.Sprintf("course:rebuild_lock:%d", courseID)
+}
+
 // StudentSelectedKey 返回“学生已选课程集合”这个 Redis 键。
 func StudentSelectedKey(studentID uint64) string {
 	// 学生已选课程集合缓存键。
@@ -69,4 +79,14 @@ func StudentCreditLimitKey(studentID uint64) string {
 func StudentSlotBitmapKey(studentID uint64) string {
 	// 学生时间片位图缓存键。
 	return fmt.Sprintf("student:slot_bitmap:%d", studentID)
+}
+
+// StudentMissingKey 返回“学生不存在”空值缓存键。
+func StudentMissingKey(studentID uint64) string {
+	return fmt.Sprintf("student:missing:%d", studentID)
+}
+
+// StudentRebuildLockKey 返回学生缓存重建锁键。
+func StudentRebuildLockKey(studentID uint64) string {
+	return fmt.Sprintf("student:rebuild_lock:%d", studentID)
 }

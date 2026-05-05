@@ -20,7 +20,8 @@ const (
 	AuthUserStateDisabled AuthUserState = 0
 	AuthUserStateActive   AuthUserState = 1
 
-	authUserCacheTTL = 10 * time.Minute
+	authUserCacheBaseTTL = 9 * time.Minute
+	authUserCacheJitter  = 3 * time.Minute
 )
 
 // AuthUserStateKey 返回某个认证账号状态缓存的 Redis key。
@@ -68,7 +69,7 @@ func SetAuthUserState(ctx context.Context, role string, userID uint64, state Aut
 		return err
 	}
 
-	return client.Set(ctx, AuthUserStateKey(role, userID), int(state), authUserCacheTTL).Err()
+	return client.Set(ctx, AuthUserStateKey(role, userID), int(state), authUserStateTTL()).Err()
 }
 
 // InvalidateAuthUserState 删除账号状态缓存。
@@ -79,4 +80,8 @@ func InvalidateAuthUserState(ctx context.Context, role string, userID uint64) er
 	}
 
 	return client.Del(ctx, AuthUserStateKey(role, userID)).Err()
+}
+
+func authUserStateTTL() time.Duration {
+	return ttlWithJitter(authUserCacheBaseTTL, authUserCacheJitter)
 }

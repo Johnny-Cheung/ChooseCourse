@@ -82,7 +82,7 @@ func (s *SelectionAsyncService) SubmitSelectCourse(studentID, courseID uint64) (
 
 	precheckCode, err := cache.PrecheckAndReserveSelection(ctx, studentID, courseID)
 	if err != nil {
-		return nil, err
+		return nil, mapSelectionCacheError(err)
 	}
 	if err := mapSelectPrecheckCode(precheckCode); err != nil {
 		return nil, err
