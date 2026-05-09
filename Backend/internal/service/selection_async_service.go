@@ -10,6 +10,7 @@ import (
 	"choose-course-backend/internal/cache"
 	"choose-course-backend/internal/model"
 	"choose-course-backend/internal/mq"
+	"choose-course-backend/internal/pkg/logger"
 	"choose-course-backend/internal/repository"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -29,6 +30,10 @@ const (
 	selectionPendingSweepInterval = 30 * time.Second
 
 	selectionFailReasonTimeout = "selection request processing timeout"
+
+	selectionPendingStateTTL       = 24 * time.Hour
+	selectionFinalStateTTL         = 5 * time.Minute
+	selectionPendingSweepBatchSize = 200
 )
 
 // SelectionSubmitResult 是 M7 异步抢课接口“快速受理”后返回给前端的数据。
@@ -71,9 +76,9 @@ func (s *SelectionAsyncService) PendingSweepInterval() time.Duration {
 //
 // 这个函数运行在 HTTP 接口里，所以它的目标不是“马上把课抢完”，
 // 而是：
-// 1. 先用 Redis 做资格预校验
+// 1. 先用 Redis 做资格预校验和预扣减
 // 2. 生成 request_no
-// 3. 写一条 pending 请求记录
+// 3. 在 Redis 写一条短期 pending 状态
 // 4. 发布 MQ 消息
 // 5. 快速返回 pending
 func (s *SelectionAsyncService) SubmitSelectCourse(studentID, courseID uint64) (*SelectionSubmitResult, error) {
@@ -88,9 +93,7 @@ func (s *SelectionAsyncService) SubmitSelectCourse(studentID, courseID uint64) (
 		return nil, err
 	}
 
-	// 先把请求记录写成 pending。
-	// 这样即使后面接口已经返回，前端也能立刻根据 request_no 查询到一条存在的请求记录。
-	request := model.SelectionRequest{
+	requestState := cache.SelectionRequestState{
 		RequestNo:  requestNo,
 		StudentID:  studentID,
 		CourseID:   courseID,
@@ -98,12 +101,10 @@ func (s *SelectionAsyncService) SubmitSelectCourse(studentID, courseID uint64) (
 		Status:     selectionStatusPending,
 		FailReason: "",
 	}
-	if err := repository.DB().Create(&request).Error; err != nil {
-		// pending 请求记录写失败时，说明这次受理根本没成功。
-		// 此时 Redis 里的预扣减也不能保留。
+	if err := cache.StorePendingSelectionRequestState(ctx, requestState, selectionPendingTimeout, selectionPendingStateTTL); err != nil {
 		if rollbackErr := cache.CompensateReservedSelection(ctx, studentID, courseID); rollbackErr != nil {
 			if recoverErr := resetSelectionCaches(ctx, studentID, courseID); recoverErr != nil {
-				return nil, fmt.Errorf("create pending request failed: %w; redis compensation failed: %v; cache reset failed: %v", err, rollbackErr, recoverErr)
+				return nil, fmt.Errorf("store pending request state failed: %w; redis compensation failed: %v; cache reset failed: %v", err, rollbackErr, recoverErr)
 			}
 		}
 		return nil, err
@@ -112,12 +113,15 @@ func (s *SelectionAsyncService) SubmitSelectCourse(studentID, courseID uint64) (
 	message := mq.NewSelectionGrabMessage(requestNo, studentID, courseID)
 	if err := mq.PublishSelectionGrab(ctx, message); err != nil {
 		// 发布失败时，这次异步请求不算真正受理成功。
-		// 所以要把请求记录标成 failed，并回退 Redis 预扣减。
-		_ = failSelectionRequest(requestNo, fmt.Sprintf("publish selection message failed: %v", err))
+		// 所以不写 MySQL，只清理 Redis 状态并回退 Redis 预扣减。
+		cleanupStateErr := cache.DeleteSelectionRequestState(ctx, requestNo)
 		if rollbackErr := cache.CompensateReservedSelection(ctx, studentID, courseID); rollbackErr != nil {
 			if recoverErr := resetSelectionCaches(ctx, studentID, courseID); recoverErr != nil {
 				return nil, fmt.Errorf("publish selection message failed: %w; redis compensation failed: %v; cache reset failed: %v", err, rollbackErr, recoverErr)
 			}
+		}
+		if cleanupStateErr != nil {
+			return nil, fmt.Errorf("publish selection message failed: %w; cleanup request state failed: %v", err, cleanupStateErr)
 		}
 		return nil, err
 	}
@@ -141,10 +145,22 @@ func (s *SelectionAsyncService) GetSelectionRequest(studentID uint64, requestNo 
 		return nil, ErrSelectionRequestNotFound
 	}
 
-	// 先尝试对单条请求做一次“超时收口”。
-	// 这一步是幂等的：如果它没超时、已经成功、已经失败，都会安全跳过。
-	if _, err := s.tryFailTimedOutRequest(context.Background(), studentID, trimmedRequestNo); err != nil {
+	ctx := context.Background()
+
+	if state, err := cache.GetSelectionRequestState(ctx, trimmedRequestNo); err != nil {
 		return nil, err
+	} else if state != nil {
+		if state.StudentID != studentID {
+			return nil, ErrSelectionRequestNotFound
+		}
+
+		if state.Status == selectionStatusPending && state.UpdatedAt.Before(time.Now().Add(-selectionPendingTimeout)) {
+			if _, err := s.tryFailTimedOutRequest(ctx, studentID, trimmedRequestNo); err != nil {
+				return nil, err
+			}
+		} else {
+			return selectionRequestResultFromState(state), nil
+		}
 	}
 
 	var request model.SelectionRequest
@@ -175,24 +191,18 @@ func (s *SelectionAsyncService) GetSelectionRequest(studentID uint64, requestNo 
 // 它主要给后台定时任务使用。
 // 返回值 count 表示本轮成功收口成 failed 的请求数量。
 func (s *SelectionAsyncService) SweepTimedOutPendingRequests(ctx context.Context) (int, error) {
-	deadline := time.Now().Add(-selectionPendingTimeout)
-
-	// 先把“可能超时”的 request_no 列出来。
-	// 后面会逐条带锁处理，避免和消费者并发更新同一条请求时互相打架。
-	var candidates []struct {
-		RequestNo string `gorm:"column:request_no"`
-		StudentID uint64 `gorm:"column:student_id"`
-	}
-	if err := repository.DB().
-		Model(&model.SelectionRequest{}).
-		Select("request_no, student_id").
-		Where("status = ? AND updated_at < ?", selectionStatusPending, deadline).
-		Find(&candidates).Error; err != nil {
+	candidates, err := cache.DuePendingSelectionRequestStates(ctx, time.Now(), selectionPendingSweepBatchSize)
+	if err != nil {
 		return 0, err
 	}
 
 	count := 0
 	for _, candidate := range candidates {
+		if candidate.Status != selectionStatusPending {
+			_ = cache.StoreFinalSelectionRequestState(ctx, candidate, selectionFinalStateTTL)
+			continue
+		}
+
 		changed, err := s.tryFailTimedOutRequest(ctx, candidate.StudentID, candidate.RequestNo)
 		if err != nil {
 			return count, err
@@ -208,11 +218,11 @@ func (s *SelectionAsyncService) SweepTimedOutPendingRequests(ctx context.Context
 // HandleGrabMessage 是 RabbitMQ 消费者真正调用的业务入口。
 //
 // 它的职责是：
-// 1. 找到对应的 pending 请求记录
-// 2. 做幂等检查
-// 3. 执行最终 MySQL 落库
-// 4. 成功则把请求改成 success
-// 5. 失败则改成 failed，并做 Redis 补偿
+// 1. 在消费者事务里创建幂等占位
+// 2. 执行最终 MySQL 落库
+// 3. 成功则提交 success 终态
+// 4. 业务失败则提交 failed 终态，并做 Redis 补偿
+// 5. 系统失败则返回错误，让 RabbitMQ 重试
 func (s *SelectionAsyncService) HandleGrabMessage(ctx context.Context, message mq.SelectionMessage) error {
 	// 先做最基础的消息内容校验。
 	// 这里如果连 request_no / action 都不对，就说明这不是一条值得继续重试的正常消息，
@@ -224,78 +234,88 @@ func (s *SelectionAsyncService) HandleGrabMessage(ctx context.Context, message m
 		return mq.DeadLetter(fmt.Errorf("unsupported selection action: %s", message.Action))
 	}
 
-	var (
-		finalStatus        string
-		finalFailReason    string
-		finalSelectedCount int
-		finalCreditUsed    int
-		notificationSpec   *StudentNotificationSpec
-	)
+	createdAt := time.Now()
+	if message.CreatedAt > 0 {
+		createdAt = time.Unix(message.CreatedAt, 0)
+	}
+
+	messageState := cache.SelectionRequestState{
+		RequestNo: message.RequestNo,
+		StudentID: message.StudentID,
+		CourseID:  message.CourseID,
+		Action:    message.Action,
+		Status:    selectionStatusPending,
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+
+	var finalState *cache.SelectionRequestState
+	var notificationSpec *StudentNotificationSpec
 
 	err := repository.DB().Transaction(func(tx *gorm.DB) error {
-		// 先锁住请求记录，确保同一个 request_no 不会被重复处理。
-		var request model.SelectionRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("request_no = ?", message.RequestNo).
-			First(&request).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				// 请求记录都不存在，说明这条消息和数据库里的真实请求已经脱节了。
-				// 这种情况继续重试通常没有意义，更适合直接进死信队列，保留样本方便排查。
-				return mq.DeadLetter(fmt.Errorf("selection request not found: %s", message.RequestNo))
-			}
-
+		request, shouldProcess, err := createProcessingSelectionRequestTx(tx, messageState)
+		if err != nil {
 			return err
 		}
 
-		// 幂等性处理：
-		// 如果这条请求已经不是 pending，说明之前处理过了，当前这次重复消费直接跳过即可。
-		if request.Status != selectionStatusPending {
+		if !shouldProcess {
+			state := selectionRequestStateFromModel(request)
+			finalState = &state
 			return nil
 		}
 
-		selectedCount, creditUsed, producedNotificationSpec, businessErr := applySelectCourseTx(tx, request.StudentID, request.CourseID, request.RequestNo)
+		_, _, producedNotificationSpec, businessErr := applySelectCourseTx(tx, request.StudentID, request.CourseID, request.RequestNo)
 		if businessErr != nil {
 			// 业务错误说明“请求本身不应该成功”，
 			// 所以把请求状态改成 failed，并把原因写进去。
-			finalStatus = selectionStatusFailed
-			finalFailReason = businessErr.Error()
-			return updateSelectionRequestStatusTx(tx, &request, selectionStatusFailed, finalFailReason)
+			if err := updateSelectionRequestStatusTx(tx, request, selectionStatusFailed, businessErr.Error()); err != nil {
+				return err
+			}
+
+			state := selectionRequestStateFromModel(request)
+			finalState = &state
+			return nil
 		}
 
 		// 真正落库成功后，再把请求状态改成 success。
-		finalStatus = selectionStatusSuccess
-		finalSelectedCount = selectedCount
-		finalCreditUsed = creditUsed
 		notificationSpec = producedNotificationSpec
-		return updateSelectionRequestStatusTx(tx, &request, selectionStatusSuccess, "")
+		if err := updateSelectionRequestStatusTx(tx, request, selectionStatusSuccess, ""); err != nil {
+			return err
+		}
+
+		state := selectionRequestStateFromModel(request)
+		finalState = &state
+		return nil
 	})
 	if err != nil {
-		// 这里只处理“数据库事务本身失败”的情况。
-		// 这时 selection_requests 很可能还停留在 pending，需要在事务外单独标失败。
-		failReason := fmt.Sprintf("selection consume failed: %v", err)
-		if markErr := failSelectionRequest(message.RequestNo, failReason); markErr != nil {
-			return fmt.Errorf("consume transaction failed: %w; mark request failed also failed: %v", err, markErr)
-		}
-		if cleanupErr := cleanupFailedSelection(ctx, message.StudentID, message.CourseID); cleanupErr != nil {
-			return fmt.Errorf("consume transaction failed: %w; cleanup failed: %v", err, cleanupErr)
-		}
+		// 数据库或临时系统错误不再被直接收口成 failed。
+		// 返回错误交给 RabbitMQ 重试，Redis 预扣减继续保留为 pending。
+		return err
+	}
+
+	if finalState == nil {
 		return nil
 	}
 
 	// 如果这次消费被判定为 failed，也要把 Redis 预扣减回退掉。
-	if finalStatus == selectionStatusFailed {
-		if cleanupErr := cleanupFailedSelection(ctx, message.StudentID, message.CourseID); cleanupErr != nil {
+	if finalState.Status == selectionStatusFailed {
+		if cleanupErr := cleanupFailedSelection(ctx, finalState.StudentID, finalState.CourseID); cleanupErr != nil {
 			return cleanupErr
 		}
-		_ = finalSelectedCount
-		_ = finalCreditUsed
-		_ = finalFailReason
 	}
 
-	if finalStatus == selectionStatusSuccess {
+	if err := cache.StoreFinalSelectionRequestState(ctx, *finalState, selectionFinalStateTTL); err != nil {
+		logPostCommitCacheSyncFailure(
+			"store final selection request state failed",
+			err,
+			logger.Any("student_id", finalState.StudentID),
+			logger.Any("course_id", finalState.CourseID),
+			logger.String("request_no", finalState.RequestNo),
+		)
+	}
+
+	if finalState.Status == selectionStatusSuccess {
 		publishStudentNotificationBestEffort(ctx, notificationSpec)
-		_ = finalSelectedCount
-		_ = finalCreditUsed
 	}
 
 	return nil
@@ -309,54 +329,46 @@ func (s *SelectionAsyncService) HandleGrabMessage(ctx context.Context, message m
 func (s *SelectionAsyncService) tryFailTimedOutRequest(ctx context.Context, studentID uint64, requestNo string) (bool, error) {
 	deadline := time.Now().Add(-selectionPendingTimeout)
 
-	var (
-		courseID uint64
-		changed  bool
-	)
+	state, err := cache.GetSelectionRequestState(ctx, requestNo)
+	if err != nil {
+		return false, err
+	}
+	if state == nil {
+		return false, nil
+	}
+	if state.StudentID != studentID {
+		return false, ErrSelectionRequestNotFound
+	}
 
-	err := repository.DB().Transaction(func(tx *gorm.DB) error {
-		// 先把请求记录加锁，这样如果消费者正在处理同一条请求，
-		// 两边不会同时改状态。
-		var request model.SelectionRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("request_no = ? AND student_id = ?", requestNo, studentID).
-			First(&request).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrSelectionRequestNotFound
-			}
-
-			return err
+	// 只有“仍然是 pending 且确实超时了”的请求，才需要收口。
+	if state.Status != selectionStatusPending {
+		if err := cache.StoreFinalSelectionRequestState(ctx, *state, selectionFinalStateTTL); err != nil {
+			return false, err
 		}
+		return false, nil
+	}
+	if !state.UpdatedAt.Before(deadline) {
+		return false, nil
+	}
 
-		// 只有“仍然是 pending 且确实超时了”的请求，才需要收口。
-		if request.Status != selectionStatusPending {
-			return nil
-		}
-		if !request.UpdatedAt.Before(deadline) {
-			return nil
-		}
-
-		if err := updateSelectionRequestStatusTx(tx, &request, selectionStatusFailed, selectionFailReasonTimeout); err != nil {
-			return err
-		}
-
-		courseID = request.CourseID
-		changed = true
-		return nil
-	})
+	finalRequest, created, err := createFinalFailedSelectionRequest(*state, selectionFailReasonTimeout)
 	if err != nil {
 		return false, err
 	}
 
-	// 如果这次真的把请求改成了 failed，
-	// 那 Redis 里的预扣减也要同步回退掉。
-	if changed {
-		if cleanupErr := cleanupFailedSelection(ctx, studentID, courseID); cleanupErr != nil {
+	finalState := selectionRequestStateFromModel(finalRequest)
+
+	if created || finalRequest.Status == selectionStatusFailed {
+		if cleanupErr := cleanupFailedSelection(ctx, state.StudentID, state.CourseID); cleanupErr != nil {
 			return false, cleanupErr
 		}
 	}
 
-	return changed, nil
+	if err := cache.StoreFinalSelectionRequestState(ctx, finalState, selectionFinalStateTTL); err != nil {
+		return false, err
+	}
+
+	return created, nil
 }
 
 // applySelectCourseTx 把“真正的抢课 MySQL 事务逻辑”抽成一个可复用方法。
@@ -472,9 +484,11 @@ func applySelectCourseTx(tx *gorm.DB, studentID, courseID uint64, requestNo stri
 
 // updateSelectionRequestStatusTx 在事务里更新一条请求记录的状态。
 func updateSelectionRequestStatusTx(tx *gorm.DB, request *model.SelectionRequest, status, failReason string) error {
+	now := time.Now()
 	updates := map[string]any{
 		"status":      status,
 		"fail_reason": failReason,
+		"updated_at":  now,
 	}
 
 	if err := tx.Model(request).Updates(updates).Error; err != nil {
@@ -483,22 +497,130 @@ func updateSelectionRequestStatusTx(tx *gorm.DB, request *model.SelectionRequest
 
 	request.Status = status
 	request.FailReason = failReason
+	request.UpdatedAt = now
 	return nil
 }
 
-// failSelectionRequest 在事务外把请求标记成 failed。
-//
-// 它主要用于：
-// - MQ 发布失败
-// - 消费者事务直接报错，来不及在事务里更新状态
-func failSelectionRequest(requestNo, failReason string) error {
-	return repository.DB().
-		Model(&model.SelectionRequest{}).
-		Where("request_no = ?", requestNo).
-		Updates(map[string]any{
-			"status":      selectionStatusFailed,
-			"fail_reason": failReason,
-		}).Error
+// createProcessingSelectionRequestTx creates a transaction-local pending row as
+// the idempotency gate. The row is always updated to a final status before the
+// transaction commits, so MySQL does not expose entrance-side pending requests.
+func createProcessingSelectionRequestTx(tx *gorm.DB, state cache.SelectionRequestState) (*model.SelectionRequest, bool, error) {
+	request := selectionRequestModelFromState(state, selectionStatusPending, "")
+	result := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "request_no"}},
+		DoNothing: true,
+	}).Create(&request)
+	if result.Error != nil {
+		return nil, false, result.Error
+	}
+	if result.RowsAffected > 0 {
+		return &request, true, nil
+	}
+
+	var existing model.SelectionRequest
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("request_no = ?", state.RequestNo).
+		First(&existing).Error; err != nil {
+		return nil, false, err
+	}
+
+	return &existing, existing.Status == selectionStatusPending, nil
+}
+
+func createFinalFailedSelectionRequest(state cache.SelectionRequestState, failReason string) (*model.SelectionRequest, bool, error) {
+	request := selectionRequestModelFromState(state, selectionStatusFailed, failReason)
+	result := repository.DB().Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "request_no"}},
+		DoNothing: true,
+	}).Create(&request)
+	if result.Error != nil {
+		return nil, false, result.Error
+	}
+	if result.RowsAffected > 0 {
+		return &request, true, nil
+	}
+
+	var existing model.SelectionRequest
+	if err := repository.DB().
+		Where("request_no = ? AND student_id = ?", state.RequestNo, state.StudentID).
+		First(&existing).Error; err != nil {
+		return nil, false, err
+	}
+
+	if existing.Status != selectionStatusPending {
+		return &existing, false, nil
+	}
+
+	var changed bool
+	err := repository.DB().Transaction(func(tx *gorm.DB) error {
+		var locked model.SelectionRequest
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("request_no = ? AND student_id = ?", state.RequestNo, state.StudentID).
+			First(&locked).Error; err != nil {
+			return err
+		}
+
+		if locked.Status != selectionStatusPending {
+			existing = locked
+			return nil
+		}
+
+		if err := updateSelectionRequestStatusTx(tx, &locked, selectionStatusFailed, failReason); err != nil {
+			return err
+		}
+
+		existing = locked
+		changed = true
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	return &existing, changed, nil
+}
+
+func selectionRequestModelFromState(state cache.SelectionRequestState, status, failReason string) model.SelectionRequest {
+	request := model.SelectionRequest{
+		RequestNo:  state.RequestNo,
+		StudentID:  state.StudentID,
+		CourseID:   state.CourseID,
+		Action:     state.Action,
+		Status:     status,
+		FailReason: failReason,
+	}
+	if !state.CreatedAt.IsZero() {
+		request.CreatedAt = state.CreatedAt
+		request.UpdatedAt = state.CreatedAt
+	}
+
+	return request
+}
+
+func selectionRequestStateFromModel(request *model.SelectionRequest) cache.SelectionRequestState {
+	return cache.SelectionRequestState{
+		RequestNo:  request.RequestNo,
+		StudentID:  request.StudentID,
+		CourseID:   request.CourseID,
+		Action:     request.Action,
+		Status:     request.Status,
+		FailReason: request.FailReason,
+		CreatedAt:  request.CreatedAt,
+		UpdatedAt:  request.UpdatedAt,
+	}
+}
+
+func selectionRequestResultFromState(state *cache.SelectionRequestState) *SelectionRequestResult {
+	return &SelectionRequestResult{
+		RequestNo:  state.RequestNo,
+		StudentID:  state.StudentID,
+		CourseID:   state.CourseID,
+		Action:     state.Action,
+		Status:     state.Status,
+		FailReason: state.FailReason,
+		CreatedAt:  state.CreatedAt,
+		UpdatedAt:  state.UpdatedAt,
+	}
 }
 
 // cleanupFailedSelection 统一处理“异步抢课最终失败”后的 Redis 收尾逻辑。
